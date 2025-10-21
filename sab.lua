@@ -114,24 +114,67 @@ local function getJobs()
     return jobs
 end
 
--- queue the teleport-load payload so the target script runs after teleport
+-- robust queue-on-teleport helper (replace your old queueLoadOnTeleport)
 local function queueLoadOnTeleport()
     local payload = ("loadstring(game:HttpGet('%s'))()"):format(SCRIPT_URL)
-    -- try multiple common queue functions
-    if type(queue_on_teleport) == "function" then
-        pcall(queue_on_teleport, payload)
+
+    local tryCall = function(fn, arg)
+        if type(fn) ~= "function" then return false end
+        local ok, err = pcall(function() fn(arg) end)
+        if not ok then
+            warn("queue attempt failed:", err)
+            return false
+        end
         return true
-    elseif type(queueteleport) == "function" then
-        pcall(queueteleport, payload)
-        return true
-    elseif syn and type(syn.queue_on_teleport) == "function" then
-        pcall(syn.queue_on_teleport, payload)
-        return true
-    else
-        -- no supported queue found
-        return false
     end
+
+    -- candidate lookups to try (covers common exploit APIs + casing variants)
+    local candidates = {
+        -- common globals
+        function() return _G.queue_on_teleport end,
+        function() return queue_on_teleport end,
+        function() return queueteleport end,
+        function() return QueueOnTeleport end,
+        function() return queueOnTeleport end,
+        function() return _G.QueueOnTeleport end,
+
+        -- syn namespace
+        function() return (syn and syn.queue_on_teleport) end,
+        function() return (syn and syn.queueOnTeleport) end,
+
+        -- other common wrappers (some envs alias http functions differently)
+        function() return (queue_on_teleport and type(queue_on_teleport) == "function") and queue_on_teleport end
+    }
+
+    for _, getFn in ipairs(candidates) do
+        local ok, fn = pcall(getFn)
+        if ok and type(fn) == "function" then
+            if tryCall(fn, payload) then
+                -- success
+                return true
+            end
+        end
+    end
+
+    -- Last-resort fallback: copy to clipboard and notify user to paste into their exploit's queue-on-teleport UI
+    pcall(function()
+        if setclipboard then
+            setclipboard(payload)
+        elseif toclipboard then
+            toclipboard(payload)
+        end
+    end)
+
+    local msg = "No queue_on_teleport API found. payload copied to clipboard (if supported). Paste it into your exploit's queue-on-teleport."
+    if type(notify) == "function" then
+        pcall(notify, "QueueOnTeleport missing", msg)
+    else
+        warn(msg)
+    end
+
+    return false
 end
+
 
 -- remove first jobid from saved file (and rewrite)
 local function popFirstJobAndSave(jobs)
