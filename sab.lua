@@ -1,28 +1,17 @@
--- job_joiner.lua
--- saves jobids to jobids.json and refreshes if older than 30 minutes
--- queues sab.lua to run on teleport
+-- sab.lua
+-- runs inside each server: scans Plots/AnimalPodiums, finds animals > $1M/s, sends webhook
 
 local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RUN_SERVICE = game:GetService("RunService")
 
+local WEBHOOK = "https://discordapp.com/api/webhooks/1430218527465406474/eqqZHo0Wfdk2-DE47skAmXqQpnRL53JkC_LhC9NvLQGZs7-v-KV544NvgX-ZFCrInbIr"
 local PLACE_ID = tostring(game.PlaceId)
-local JOBS_FILE = "jobids.json"
-local JOBS_URL = ("https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=50"):format(PLACE_ID)
+local JOB_ID = tostring(game.JobId or "unknown")
+local MIN_GEN_THRESHOLD = 1e6 -- 1,000,000 per second
 
--- You can either queue the remote URL below OR inline sab.lua contents
-local REMOTE_SAB_URL = "https://raw.githubusercontent.com/ggslashtraced/trackaimtrainer/refs/heads/main/sab.lua"
--- If you prefer to queue an inline payload (embedded sab contents), set INLINE_PAYLOAD to true
-local INLINE_PAYLOAD = false
-
--- If INLINE_PAYLOAD==true, set INLINE_SAB_PAYLOAD to the payload string (see note below).
--- It's often easier to use REMOTE_SAB_URL (default). If you want inline, set INLINE_PAYLOAD=true and
--- paste the contents of sab.lua into INLINE_SAB_PAYLOAD (escaped). For safety we default to remote.
-local INLINE_SAB_PAYLOAD = nil
-
-local MIN_AGE_SECONDS = 30 * 60 -- 30 minutes
-
--- robust request function (user-provided style)
+-- robust HTTP request
 local function requestFunc(tab)
     if syn and syn.request then
         return syn.request(tab)
@@ -35,198 +24,146 @@ local function requestFunc(tab)
     end
 end
 
--- time helper
-local function now()
-    local ok, t = pcall(function() return os.time() end)
-    if ok and type(t) == "number" then return t end
-    ok, t = pcall(function() return tick() end)
-    if ok and type(t) == "number" then return t end
-    return 0
+-- parse "$8.7K/s" / "$1.2M/s" -> number
+local function parseGeneration(genText)
+    if not genText or type(genText) ~= "string" then return nil end
+    -- match like $8.7K/s or $870/s or $1.2M/s
+    local num, unit = genText:match("%$(%d+%.?%d*)([KM]?)")
+    if not num then return nil end
+    local n = tonumber(num)
+    if not n then return nil end
+    if unit == "K" then n = n * 1e3
+    elseif unit == "M" then n = n * 1e6 end
+    return n
 end
 
--- file helpers
-local function fileExists(path)
-    if type(isfile) == "function" then
-        return isfile(path)
+-- scan plots and return animals above threshold
+local function scanAnimals()
+    local found = {}
+    local plotsRoot = Workspace:FindFirstChild("Plots") or Workspace -- fallback to Workspace if path differs
+    for _, plot in pairs((plotsRoot:GetChildren())) do
+        if plot:IsA("Model") or type(plot) == "Instance" then
+            local podiums = plot:FindFirstChild("AnimalPodiums")
+            if podiums and podiums:GetChildren() then
+                for _, podium in ipairs(podiums:GetChildren()) do
+                    local base = podium:FindFirstChild("Base")
+                    local spawn = base and base:FindFirstChild("Spawn")
+                    local attachment = spawn and spawn:FindFirstChild("Attachment")
+                    local overhead = attachment and attachment:FindFirstChild("AnimalOverhead")
+                    if overhead then
+                        local display = overhead:FindFirstChild("DisplayName")
+                        local gen = overhead:FindFirstChild("Generation")
+                        local rarity = overhead:FindFirstChild("Rarity")
+                        local price = overhead:FindFirstChild("Price")
+                        local mutation = overhead:FindFirstChild("Mutation")
+
+                        local genNum = gen and parseGeneration(gen.Text)
+                        if genNum and genNum > MIN_GEN_THRESHOLD then
+                            table.insert(found, {
+                                Name = (display and display.Text) or "Unknown",
+                                Rarity = (rarity and rarity.Text) or "Unknown",
+                                Mutation = (mutation and mutation.Text) or "",
+                                Generation = (gen and gen.Text) or "Unknown",
+                                GenerationValue = genNum,
+                                Price = (price and price.Text) or "Unknown",
+                                Plot = plot.Name or "Unknown",
+                                Podium = podium.Name or "Unknown"
+                            })
+                        end
+                    end
+                end
+            end
+        end
     end
-    local ok = pcall(function() readfile(path) end)
-    return ok
+    return found
 end
 
-local function saveJobs(jobs)
-    local payload = {
-        jobs = jobs,
-        fetched_at = now()
-    }
-    pcall(function() writefile(JOBS_FILE, HttpService:JSONEncode(payload)) end)
+-- build roblox join link
+local function makeJoinLink(jobid)
+    return ("roblox://placeid=%s&gameinstance=%s"):format(PLACE_ID, tostring(jobid))
 end
 
-local function loadJobsFromFile()
-    if not fileExists(JOBS_FILE) then return nil end
-    local ok, raw = pcall(function() return readfile(JOBS_FILE) end)
-    if not ok or not raw then return nil end
-    local ok2, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not ok2 or type(decoded) ~= "table" then return nil end
-    return decoded
+-- format animals for Discord message body (plain content)
+local function formatAnimalsForDiscord(animals)
+    if not animals or #animals == 0 then return "None" end
+    local s = ""
+    for i, a in ipairs(animals) do
+        local mutPart = a.Mutation ~= "" and (" | "..a.Mutation) or ""
+        s = s .. string.format("**%s**%s — %s — Price: %s\n", a.Name, mutPart, a.Generation, a.Price)
+    end
+    return s
 end
 
--- fetch up to 50 public servers job ids
-local function fetchJobsFromRoblox()
+-- robust send
+local function sendToDiscord(jobid, animals)
+    local playercount = #Players:GetPlayers()
+    local joinLink = makeJoinLink(jobid)
+    local content = string.format(
+        "**JobID:** %s\n**Players:** %d\n**Join:** %s\n\n**Animals > $1M/s:**\n%s",
+        tostring(jobid),
+        playercount,
+        joinLink,
+        formatAnimalsForDiscord(animals)
+    )
+
+    local body = HttpService:JSONEncode({content = content})
     local ok, res = pcall(function()
         return requestFunc({
-            Url = JOBS_URL,
-            Method = "GET",
-            Headers = { ["User-Agent"] = "Roblox/WinInet" }
+            Url = WEBHOOK,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body
         })
     end)
-    if not ok or not res or (res.StatusCode and res.StatusCode ~= 200) then
-        warn("Failed to fetch jobs", res and res.StatusCode)
-        return {}
+    if not ok or not res then
+        warn("Webhook post failed", res and (res.StatusCode or res.status) or "no response")
+        return false
     end
-
-    local body = res.Body or (res and res.body) or ""
-    local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
-    if not ok2 or type(data) ~= "table" or type(data.data) ~= "table" then
-        warn("Bad jobs payload")
-        return {}
-    end
-
-    local jobs = {}
-    for _, v in ipairs(data.data) do
-        if v and v.id then
-            table.insert(jobs, tostring(v.id))
-        end
-    end
-    return jobs
-end
-
--- get jobs respecting file + age rules
-local function getJobs()
-    local fileData = loadJobsFromFile()
-    if fileData and type(fileData) == "table" then
-        if type(fileData.fetched_at) == "number" and type(fileData.jobs) == "table" and #fileData.jobs > 0 then
-            local age = now() - fileData.fetched_at
-            if age <= MIN_AGE_SECONDS then
-                return fileData.jobs
-            end
-        end
-    end
-
-    local jobs = fetchJobsFromRoblox()
-    if #jobs > 0 then
-        pcall(saveJobs, jobs)
-    end
-    return jobs
-end
-
--- robust queue-on-teleport helper
-local function queueLoadOnTeleport()
-    local payload
-    if INLINE_PAYLOAD and INLINE_SAB_PAYLOAD and type(INLINE_SAB_PAYLOAD) == "string" then
-        payload = INLINE_SAB_PAYLOAD
-    else
-        payload = ("loadstring(game:HttpGet('%s'))()"):format(REMOTE_SAB_URL)
-    end
-
-    local function tryCall(fn, arg)
-        if type(fn) ~= "function" then return false end
-        local ok, err = pcall(function() fn(arg) end)
-        if not ok then
-            warn("queue attempt failed:", err)
-            return false
-        end
+    if (res.StatusCode and res.StatusCode >= 200 and res.StatusCode < 300) or (res.status and res.status >= 200 and res.status < 300) then
         return true
+    else
+        warn("Webhook responded:", res.StatusCode or res.status, res.Body or res.body)
+        return false
     end
-
-    local candidates = {
-        function() return _G.queue_on_teleport end,
-        function() return queue_on_teleport end,
-        function() return queueteleport end,
-        function() return QueueOnTeleport end,
-        function() return queueOnTeleport end,
-        function() return _G.QueueOnTeleport end,
-        function() return (syn and syn.queue_on_teleport) end,
-        function() return (syn and syn.queueOnTeleport) end,
-        function() return (syn and syn.queue_on_teleport and syn.queue_on_teleport) end,
-    }
-
-    for _, getFn in ipairs(candidates) do
-        local ok, fn = pcall(getFn)
-        if ok and type(fn) == "function" then
-            if tryCall(fn, payload) then
-                return true
-            end
-        end
-    end
-
-    -- last-resort: copy payload to clipboard and notify
-    pcall(function()
-        if setclipboard then setclipboard(payload) end
-        if toclipboard then toclipboard(payload) end
-    end)
-
-    local msg = "No queue_on_teleport API found. Payload copied to clipboard if supported. Paste it into your exploit's queue box."
-    if type(notify) == "function" then pcall(notify, "QueueOnTeleport missing", msg) else warn(msg) end
-    return false
 end
 
--- remove first jobid and save
-local function popFirstJobAndSave(jobs)
-    if type(jobs) ~= "table" or #jobs == 0 then return {} end
-    table.remove(jobs, 1)
-    pcall(saveJobs, jobs)
-    return jobs
-end
-
--- main loop
+-- main runner: scan, send (with retries), optional cooldown
 spawn(function()
-    local jobs = getJobs() or {}
-    if #jobs == 0 then
-        warn("No jobs found")
+    -- tiny delay so game can load
+    local maxWait = 8
+    for i=1, maxWait do
+        if Workspace:IsAncestorOf(Players.LocalPlayer.Character or Players.LocalPlayer) then break end
+        wait(0.5)
+    end
+
+    local animals = {}
+    local ok, res = pcall(function() animals = scanAnimals() end)
+    if not ok then
+        warn("scanAnimals failed:", res)
         return
     end
 
-    while true do
-        local fileData = loadJobsFromFile()
-        if fileData and type(fileData.jobs) == "table" and #fileData.jobs > 0 then
-            jobs = fileData.jobs
-        end
+    if not animals or #animals == 0 then
+        -- nothing to report; optionally exit quietly
+        -- you can uncomment to still notify empty servers:
+        -- sendToDiscord(JOB_ID, animals)
+        return
+    end
 
-        local currentJob = jobs[1]
-        if not currentJob then
-            jobs = fetchJobsFromRoblox()
-            if #jobs == 0 then
-                warn("No jobs available, waiting 30s then retry")
-                wait(30)
-                continue
-            else
-                pcall(saveJobs, jobs)
-                currentJob = jobs[1]
-            end
-        end
-
-        local okQueue = queueLoadOnTeleport()
-        if not okQueue then
-            if type(notify) == "function" then
-                pcall(notify, "Incompatible Exploit", "Your exploit does not support queue_on_teleport / queueteleport")
-            else
-                warn("Incompatible Exploit: missing queue_on_teleport / queueteleport")
-            end
-            return
-        end
-
-        local success, err = pcall(function()
-            TeleportService:TeleportToPlaceInstance(tonumber(PLACE_ID), currentJob, Players.LocalPlayer)
-        end)
-        if not success then
-            warn("Teleport failed:", err)
-            jobs = popFirstJobAndSave(jobs)
-            wait(3)
+    -- send, with a small retry loop to be safer
+    local attempts = 0
+    local success = false
+    while attempts < 3 and not success do
+        attempts = attempts + 1
+        local s, e = pcall(function() return sendToDiscord(JOB_ID, animals) end)
+        if s and e then
+            success = true
         else
-            jobs = popFirstJobAndSave(jobs)
+            warn("send attempt failed, retrying in 2s", attempts, e)
             wait(2)
         end
-
-        wait(1)
     end
+
+    -- optional: after reporting, wait a bit then destroy this script / hang to avoid double posts
+    wait(1)
 end)
